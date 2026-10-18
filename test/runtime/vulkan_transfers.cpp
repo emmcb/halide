@@ -25,6 +25,13 @@ VkDevice test_device = (VkDevice)1;
 bool reject_unified_allocation;
 int copies, maps, unmaps, barriers, flushes, invalidates, waits;
 int submissions, pools_created, pools_destroyed;
+int pipelines, pipelines_created;
+VkResult pipeline_result = VK_SUCCESS;
+
+struct TestPipeline {
+    uint32_t threads;
+};
+
 VkResult submit_result = VK_SUCCESS;
 VkResult wait_result = VK_SUCCESS;
 VkResult end_result = VK_SUCCESS;
@@ -301,6 +308,98 @@ int release(void *, VkInstance, VkDevice, VkQueue, VkDebugUtilsMessengerEXT) {
 void ignore_error(void *, const char *) {
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL create_pipelines(VkDevice, VkPipelineCache, uint32_t count, const VkComputePipelineCreateInfo *info, const VkAllocationCallbacks *, VkPipeline *out) {
+    check(count == 1);
+    pipelines_created++;
+    if (pipeline_result != VK_SUCCESS) {
+        *out = VK_NULL_HANDLE;
+        return pipeline_result;
+    }
+    pipelines++;
+    auto *pipeline = (TestPipeline *)allocate_zeroed(sizeof(TestPipeline));
+    if (info->stage.pSpecializationInfo) {
+        pipeline->threads = ((const uint32_t *)info->stage.pSpecializationInfo->pData)[0];
+    }
+    *out = (VkPipeline)pipeline;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL destroy_pipeline(VkDevice, VkPipeline handle, const VkAllocationCallbacks *) {
+    check(!pending_commands);
+    pipelines--;
+    free((void *)handle);
+}
+
+void test_pipeline_cache() {
+    VulkanSpecializationConstant constants[] = {{1, 4, "x"}, {2, 4, "y"}, {3, 4, "z"}, {4, 4, "shared"}};
+    VulkanSharedMemoryAllocation allocation = {4, 4, 0, "shared"};
+    VulkanShaderBinding binding = {};
+    binding.entry_point_name = const_cast<char *>("test");
+    binding.specialization_constants = constants;
+    binding.specialization_constants_count = 4;
+    binding.shared_memory_allocations = &allocation;
+    binding.shared_memory_allocations_count = 1;
+    binding.dispatch_data.local_size_binding = {{1, 2, 3}};
+    VulkanDispatchData data = {};
+    data.local_size[0] = data.local_size[1] = data.local_size[2] = 1;
+    data.shared_mem_bytes = 16;
+    auto setup = [&](VulkanShaderBinding &b, VkPipeline *out) {
+        return vk_setup_compute_pipeline(nullptr, allocator, &b, &data, (VkShaderModule)1, (VkPipelineLayout)1, out);
+    };
+    const int created_before = pipelines_created;
+    VkPipeline original = VK_NULL_HANDLE, pipeline = VK_NULL_HANDLE;
+    check(setup(binding, &original) == 0 && original != VK_NULL_HANDLE);
+    check(setup(binding, &pipeline) == 0 && pipeline == original);
+    data.global_size[0] = 17;
+    check(setup(binding, &pipeline) == 0 && pipeline == original);
+    check(pipelines_created == created_before + 1);
+
+    // Each local dimension and dynamic shared memory affect specialization.
+    for (int dim = 0; dim < 3; dim++) {
+        data.local_size[dim] = 2;
+        check(setup(binding, &pipeline) == 0 && pipeline != original);
+        data.local_size[dim] = 1;
+        check(setup(binding, &pipeline) == 0 && pipeline == original);
+    }
+    data.shared_mem_bytes = 32;
+    check(setup(binding, &pipeline) == 0 && pipeline != original);
+    data.shared_mem_bytes = 16;
+    check(setup(binding, &pipeline) == 0 && pipeline == original);
+    check(pipelines_created == created_before + 5 && pipelines == 5);
+
+    // A failed creation must leave existing variants reusable and allow retry.
+    pipeline_result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    data.shared_mem_bytes = 64;
+    check(setup(binding, &pipeline) != 0 && pipelines == 5);
+    data.shared_mem_bytes = 16;
+    check(setup(binding, &pipeline) == 0 && pipeline == original);
+    pipeline_result = VK_SUCCESS;
+    data.shared_mem_bytes = 64;
+    check(setup(binding, &pipeline) == 0 && pipeline != original && pipelines == 6);
+
+    // Equal specialization values in another binding must not share pipelines.
+    VulkanShaderBinding other = binding;
+    other.entry_point_name = const_cast<char *>("other");
+    other.specialized_pipelines = nullptr;
+    VkPipeline separate = VK_NULL_HANDLE;
+    check(setup(other, &separate) == 0 && separate != pipeline);
+    vk_destroy_shader_binding_pipelines(nullptr, allocator, &other);
+
+    // A shared-memory-only binding can use both the default and specialized
+    // pipeline, without overwriting or destroying either cached variant.
+    vk_destroy_shader_binding_pipelines(nullptr, allocator, &binding);
+    check(pipelines == 0 && binding.specialized_pipelines == nullptr);
+    binding.dispatch_data.local_size_binding = {};
+    data.shared_mem_bytes = 0;
+    check(setup(binding, &original) == 0 && original == binding.compute_pipeline);
+    data.shared_mem_bytes = 16;
+    check(setup(binding, &pipeline) == 0 && pipeline != original);
+    data.shared_mem_bytes = 0;
+    check(setup(binding, &pipeline) == 0 && pipeline == original);
+    vk_destroy_shader_binding_pipelines(nullptr, allocator, &binding);
+    check(pipelines == 0 && binding.compute_pipeline == VK_NULL_HANDLE && binding.specialized_pipelines == nullptr);
+}
+
 void test_transfers(bool coherent, bool unified, bool reject_allocation = false, bool cached_memory = false) {
     const bool visible = unified && !reject_allocation;
     const bool mapped = visible && coherent;
@@ -493,6 +592,18 @@ int main(int, char **) {
     Halide::Runtime::Internal::Vulkan::release_context = release;
     halide_set_error_handler(ignore_error);
     halide_reuse_device_allocations(nullptr, false);
+
+    vkCreateComputePipelines = create_pipelines;
+    vkDestroyPipeline = destroy_pipeline;
+    memory_properties = {};
+    memory_properties.memoryTypeCount = 1;
+    memory_properties.memoryTypes[0].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    allocator = VulkanMemoryAllocator::create(nullptr, VulkanMemoryAllocator::default_config(), test_device, (VkPhysicalDevice)1,
+                                              {vk_system_malloc, vk_system_free});
+    check(allocator != nullptr);
+    test_pipeline_cache();
+    check(VulkanMemoryAllocator::destroy(nullptr, allocator) == 0);
+    allocator = nullptr;
 
     test_transfers(true, true);
     test_transfers(false, true);

@@ -1365,8 +1365,9 @@ WEAK int halide_vulkan_run(void *user_context,
 
     VulkanShaderBinding *entry_point_binding = (shader_module->shader_bindings + entry_point_index);
 
+    VkPipeline compute_pipeline = VK_NULL_HANDLE;
     // 2c. Setup the compute pipeline (eg override any specializations for shared mem or workgroup size)
-    error_code = vk_setup_compute_pipeline(user_context, ctx.allocator, entry_point_binding, &dispatch_data, shader_module->shader_module, shader_module->pipeline_layout, &(entry_point_binding->compute_pipeline));
+    error_code = vk_setup_compute_pipeline(user_context, ctx.allocator, entry_point_binding, &dispatch_data, shader_module->shader_module, shader_module->pipeline_layout, &compute_pipeline);
     if (error_code != halide_error_code_success) {
         error(user_context) << "Vulkan: Failed to setup compute pipeline!\n";
         return error_code;
@@ -1441,7 +1442,7 @@ WEAK int halide_vulkan_run(void *user_context,
     // 5. Fill the command buffer
     error_code = vk_fill_command_buffer_with_dispatch_call(user_context,
                                                            ctx.device, cmds.command_buffer,
-                                                           entry_point_binding->compute_pipeline,
+                                                           compute_pipeline,
                                                            shader_module->pipeline_layout,
                                                            entry_point_binding->descriptor_set,
                                                            entry_point_index,

@@ -24,6 +24,7 @@ namespace Vulkan {
 // Declarations
 class VulkanMemoryAllocator;
 struct VulkanShaderBinding;
+struct VulkanDispatchData;
 struct VulkanCompiledShaderModule;
 struct VulkanCompilationCacheEntry;
 
@@ -208,6 +209,7 @@ int vk_create_compute_pipeline(void *user_context,
 int vk_setup_compute_pipeline(void *user_context,
                               VulkanMemoryAllocator *allocator,
                               VulkanShaderBinding *shader_bindings,
+                              VulkanDispatchData *dispatch_data,
                               VkShaderModule shader_module,
                               VkPipelineLayout pipeline_layout,
                               VkPipeline *compute_pipeline);

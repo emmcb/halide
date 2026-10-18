@@ -39,6 +39,17 @@ struct VulkanSharedMemoryAllocation {
     const char *variable_name = nullptr;
 };
 
+// Specialized pipelines are owned by their shader binding, just like the fixed
+// pipeline. Keep every variant alive until recorded commands have completed and
+// the compiled shader module is released.
+struct VulkanComputePipelineCacheEntry {
+    VulkanComputePipelineCacheEntry *next;
+    uint32_t constant_count;
+    uint32_t constant_ids[4];
+    uint32_t constant_values[4];
+    VkPipeline pipeline;
+};
+
 // Entry point metadata for shader modules
 struct VulkanShaderBinding {
     char *entry_point_name = nullptr;
@@ -46,6 +57,7 @@ struct VulkanShaderBinding {
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkPipeline compute_pipeline = VK_NULL_HANDLE;
+    VulkanComputePipelineCacheEntry *specialized_pipelines = nullptr;
     uint32_t uniform_buffer_count = 0;
     uint32_t storage_buffer_count = 0;
     uint32_t specialization_constants_count = 0;
@@ -961,7 +973,7 @@ int vk_setup_compute_pipeline(void *user_context,
         return halide_error_code_generic_error;
     }
 
-    if (shader_bindings == nullptr) {
+    if (dispatch_data == nullptr) {
         error(user_context) << "Vulkan: Failed to setup compute pipeline ... invalid dispatch data!\n";
         return halide_error_code_generic_error;
     }
@@ -1093,21 +1105,39 @@ int vk_setup_compute_pipeline(void *user_context,
         specialization_info.pMapEntries = specialization_map_entries;
         specialization_info.pData = dispatch_constant_values;
 
-        // Recreate the pipeline with the requested shared memory allocation
-        if (shader_bindings->compute_pipeline) {
-            int error_code = vk_destroy_compute_pipeline(user_context, allocator, shader_bindings->compute_pipeline);
-            if (error_code != halide_error_code_success) {
-                error(user_context) << "Vulkan: Failed to destroy compute pipeline!\n";
-                return halide_error_code_generic_error;
+        // Only specialization constants affect pipeline creation. In particular,
+        // the number of dispatched workgroups does not belong in the cache key.
+        const size_t constants_size = dispatch_constant_count * sizeof(uint32_t);
+        for (auto *entry = shader_bindings->specialized_pipelines; entry; entry = entry->next) {
+            if (entry->constant_count == dispatch_constant_count &&
+                memcmp(entry->constant_ids, dispatch_constant_ids, constants_size) == 0 &&
+                memcmp(entry->constant_values, dispatch_constant_values, constants_size) == 0) {
+                *compute_pipeline = entry->pipeline;
+                return halide_error_code_success;
             }
-            shader_bindings->compute_pipeline = VK_NULL_HANDLE;
         }
 
-        int error_code = vk_create_compute_pipeline(user_context, allocator, entry_point_name, shader_module, pipeline_layout, &specialization_info, &(shader_bindings->compute_pipeline));
+        auto *entry = (VulkanComputePipelineCacheEntry *)vk_host_malloc(user_context, sizeof(VulkanComputePipelineCacheEntry), 0,
+                                                                        VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, allocator->callbacks());
+        if (!entry) {
+            return halide_error_code_out_of_memory;
+        }
+        memset(entry, 0, sizeof(*entry));
+        int error_code = vk_create_compute_pipeline(user_context, allocator, entry_point_name, shader_module, pipeline_layout, &specialization_info, &entry->pipeline);
         if (error_code != halide_error_code_success) {
+            if (entry->pipeline) {
+                vk_destroy_compute_pipeline(user_context, allocator, entry->pipeline);
+            }
+            vk_host_free(user_context, entry, allocator->callbacks());
             error(user_context) << "Vulkan: Failed to create compute pipeline!\n";
             return error_code;
         }
+        entry->constant_count = dispatch_constant_count;
+        memcpy(entry->constant_ids, dispatch_constant_ids, constants_size);
+        memcpy(entry->constant_values, dispatch_constant_values, constants_size);
+        entry->next = shader_bindings->specialized_pipelines;
+        shader_bindings->specialized_pipelines = entry;
+        *compute_pipeline = entry->pipeline;
 
     } else {
 
@@ -1119,9 +1149,24 @@ int vk_setup_compute_pipeline(void *user_context,
                 return error_code;
             }
         }
+        *compute_pipeline = shader_bindings->compute_pipeline;
     }
 
     return halide_error_code_success;
+}
+
+void vk_destroy_shader_binding_pipelines(void *user_context, VulkanMemoryAllocator *allocator,
+                                         VulkanShaderBinding *binding) {
+    while (binding->specialized_pipelines) {
+        auto *entry = binding->specialized_pipelines;
+        binding->specialized_pipelines = entry->next;
+        vk_destroy_compute_pipeline(user_context, allocator, entry->pipeline);
+        vk_host_free(user_context, entry, allocator->callbacks());
+    }
+    if (binding->compute_pipeline) {
+        vk_destroy_compute_pipeline(user_context, allocator, binding->compute_pipeline);
+        binding->compute_pipeline = VK_NULL_HANDLE;
+    }
 }
 
 int vk_destroy_compute_pipeline(void *user_context,
@@ -1714,11 +1759,7 @@ void vk_destroy_compiled_shader_module(VulkanCompiledShaderModule *shader_module
                 vk_host_free(user_context, shader_module->shader_bindings[n].shared_memory_allocations, allocator->callbacks());
                 shader_module->shader_bindings[n].shared_memory_allocations = nullptr;
             }
-            if (shader_module->shader_bindings[n].compute_pipeline) {
-                debug(user_context) << "  destroying shader binding compute pipeline [" << n << "]\n";
-                vk_destroy_compute_pipeline(user_context, allocator, shader_module->shader_bindings[n].compute_pipeline);
-                shader_module->shader_bindings[n].compute_pipeline = VK_NULL_HANDLE;
-            }
+            vk_destroy_shader_binding_pipelines(user_context, allocator, &shader_module->shader_bindings[n]);
         }
         vk_host_free(user_context, shader_module->shader_bindings, allocator->callbacks());
         shader_module->shader_bindings = nullptr;
