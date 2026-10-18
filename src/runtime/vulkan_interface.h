@@ -143,6 +143,12 @@ void WEAK vk_load_vulkan_device_functions(void *user_context, VkDevice device) {
 #include "vulkan_functions.h"
 #undef HL_USE_VULKAN_DEVICE_FNS
 #undef VULKAN_FN
+    // Vulkan 1.0 devices expose descriptor templates through the KHR aliases.
+    if (!vkCreateDescriptorUpdateTemplate) {
+        vkCreateDescriptorUpdateTemplate = (PFN_vkCreateDescriptorUpdateTemplate)vkGetDeviceProcAddr(device, "vkCreateDescriptorUpdateTemplateKHR");
+        vkDestroyDescriptorUpdateTemplate = (PFN_vkDestroyDescriptorUpdateTemplate)vkGetDeviceProcAddr(device, "vkDestroyDescriptorUpdateTemplateKHR");
+        vkUpdateDescriptorSetWithTemplate = (PFN_vkUpdateDescriptorSetWithTemplate)vkGetDeviceProcAddr(device, "vkUpdateDescriptorSetWithTemplateKHR");
+    }
 }
 
 // Reset the device function pointers

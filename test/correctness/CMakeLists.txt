@@ -598,6 +598,7 @@ tests(
     vectorized_initialization.cpp
     vectorized_load_from_vectorized_allocation.cpp
     vectorized_reduction_bug.cpp
+    vulkan_arguments.cpp
     vulkan_bool_scalar_abi.cpp
     vulkan_float_lerp.cpp
     widening_reduction.cpp

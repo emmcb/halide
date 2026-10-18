@@ -62,6 +62,10 @@ extern int halide_vulkan_get_native_buffer(void *user_context,
 extern int halide_vulkan_initialize_kernels(void *user_context, void **state_ptr,
                                             const char *src, int size);
 
+/** Record a dispatch in the context's pending command group, alongside
+ * device-to-device buffer copies. The group is
+ * submitted and completed by halide_vulkan_device_sync (via halide_device_sync),
+ * readback, device release, or an upload to an allocation used by the group. */
 extern int halide_vulkan_run(void *user_context,
                              void *state_ptr,
                              const char *entry_name,

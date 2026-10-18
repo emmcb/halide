@@ -288,6 +288,7 @@ protected:
         struct DescriptorSet {
             std::string entry_point_name;
             uint32_t uniform_buffer_count = 0;
+            uint32_t push_constant_bytes = 0;
             uint32_t storage_buffer_count = 0;
             SpecializationConstants specialization_constants;
             SharedMemoryUsage shared_memory_usage;
@@ -2502,7 +2503,7 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::encode_header(SpvBinary &spirv_header) {
     // ... For each descriptor set ...
     // ... [0] Length of entry point name (padded to nearest word size)
     // ....... [*] Entry point string data (padded with null chars)
-    // ... [1] Number of uniform buffers for this descriptor set
+    // ... [1] Uniform-buffer count, or 0x80000000 | push-constant argument byte count
     // ... [2] Number of storage buffers for this descriptor set
     // ... [3] Number of specialization constants for this descriptor set
     // ....... For each specialization constant ...
@@ -2547,8 +2548,10 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::encode_header(SpvBinary &spirv_header) {
         // [*] Entry point string data (padded with null chars)
         spirv_header.insert(spirv_header.end(), (const uint32_t *)entry_point_name.data(), (const uint32_t *)(entry_point_name.data() + entry_point_name.size()));
 
-        // [1] Number of uniform buffers for this descriptor set
-        spirv_header.push_back(ds.uniform_buffer_count);
+        // [1] Uniform-buffer count, or push-constant argument byte count
+        // The high bit distinguishes a push-constant argument block from the
+        // legacy uniform-buffer count. Older modules keep their original ABI.
+        spirv_header.push_back(ds.push_constant_bytes ? (0x80000000u | ds.push_constant_bytes) : ds.uniform_buffer_count);
 
         // [2] Number of storage buffers for this descriptor set
         spirv_header.push_back(ds.storage_buffer_count);
@@ -2808,9 +2811,18 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
     // First, need to count scalar parameters and buffer parameters to construct the uniform struct
     uint32_t scalar_arg_count = 0;
     uint32_t buffer_arg_count = 0;
+    uint32_t scalar_arg_bytes = 0;
+    bool can_push_constants = true;
     SpvBuilder::StructMemberTypes param_struct_members;
     for (const auto &arg : args) {
         if (!arg.is_buffer) {
+            Type storage_type = vulkan_scalar_parameter_type(arg.type);
+            // Narrow push-constant storage requires additional device features.
+            // Keep those arguments on the uniform-buffer path, as before.
+            can_push_constants &= !storage_type.is_vector() && storage_type.bits() >= 32 &&
+                                  scalar_arg_bytes % storage_type.bytes() == 0;
+            scalar_arg_bytes = align_offset(scalar_arg_bytes, storage_type.bytes());
+            scalar_arg_bytes += storage_type.bytes();
             // Add required access capability for smaller bit-width types used as runtime arrays
             if (arg.type.bits() == 8) {
                 builder.require_capability(SpvCapabilityUniformAndStorageBuffer8BitAccess);
@@ -2818,7 +2830,6 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
                 builder.require_capability(SpvCapabilityUniformAndStorageBuffer16BitAccess);
             }
 
-            Type storage_type = vulkan_scalar_parameter_type(arg.type);
             SpvId arg_type_id = builder.declare_type(storage_type);
             param_struct_members.push_back(arg_type_id);
             scalar_arg_count++;
@@ -2832,6 +2843,10 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
     Type offset_type = Int(32);
     SpvId offset_type_id = builder.declare_type(offset_type);
     param_struct_members.insert(param_struct_members.end(), size_t(buffer_arg_count), offset_type_id);
+
+    const uint32_t argument_bytes = align_offset(scalar_arg_bytes, 4) + buffer_arg_count * sizeof(int32_t);
+    can_push_constants &= argument_bytes > 0 && argument_bytes <= 128;
+    const SpvStorageClass argument_storage = can_push_constants ? SpvStorageClassPushConstant : SpvStorageClassUniform;
 
     // Add a binding for a uniform buffer packed with all scalar args
     uint32_t binding_counter = 0;
@@ -2873,16 +2888,20 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
 
         // Add a variable for the parameter pack
         const std::string param_pack_var_name = std::string("k") + std::to_string(kernel_index) + std::string("_args_var");
-        SpvId param_pack_ptr_type_id = builder.declare_pointer_type(param_struct_type_id, SpvStorageClassUniform);
-        param_pack_var_id = builder.declare_global_variable(param_pack_var_name, param_pack_ptr_type_id, SpvStorageClassUniform);
+        SpvId param_pack_ptr_type_id = builder.declare_pointer_type(param_struct_type_id, argument_storage);
+        param_pack_var_id = builder.declare_global_variable(param_pack_var_name, param_pack_ptr_type_id, argument_storage);
 
         // We always pass in the parameter pack as the first binding
         SpvBuilder::Literals binding_index = {0};
         SpvBuilder::Literals dset_index = {entry_point_index};
-        builder.add_annotation(param_pack_var_id, SpvDecorationDescriptorSet, dset_index);
-        builder.add_annotation(param_pack_var_id, SpvDecorationBinding, binding_index);
-        descriptor_set.uniform_buffer_count++;
-        binding_counter++;
+        if (can_push_constants) {
+            descriptor_set.push_constant_bytes = argument_bytes;
+        } else {
+            builder.add_annotation(param_pack_var_id, SpvDecorationDescriptorSet, dset_index);
+            builder.add_annotation(param_pack_var_id, SpvDecorationBinding, binding_index);
+            descriptor_set.uniform_buffer_count++;
+            binding_counter++;
+        }
 
         // Declare all the scalar args with appropriate offsets into the parameter struct
         uint32_t scalar_index = 0;
@@ -2891,7 +2910,7 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
                 Type storage_type = vulkan_scalar_parameter_type(arg.type);
                 SpvId storage_type_id = builder.declare_type(storage_type);
                 SpvId access_index_id = builder.declare_constant(UInt(32), &scalar_index);
-                SpvId pointer_type_id = builder.declare_pointer_type(storage_type_id, SpvStorageClassUniform);
+                SpvId pointer_type_id = builder.declare_pointer_type(storage_type_id, argument_storage);
                 SpvFactory::Indices access_indices = {access_index_id};
                 SpvId access_chain_id = builder.declare_access_chain(pointer_type_id, param_pack_var_id, access_indices);
                 scalar_index++;
@@ -2906,7 +2925,7 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
                     builder.append(SpvFactory::integer_not_equal(bool_type_id, bool_param_id, param_id, zero_id));
                     param_id = bool_param_id;
                 }
-                symbol_table.push(arg.name, {param_id, SpvStorageClassUniform});
+                symbol_table.push(arg.name, {param_id, argument_storage});
             }
         }
     }
@@ -2969,7 +2988,7 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
             if (param_pack_var_id != SpvInvalidId) {
                 uint32_t buffer_offset_index_param = scalar_arg_count + buffer_index;
                 SpvId buffer_offset_index_param_id = builder.declare_constant(UInt(32), &buffer_offset_index_param);
-                SpvId index_ptr_type_id = builder.declare_pointer_type(offset_type_id, SpvStorageClassUniform);
+                SpvId index_ptr_type_id = builder.declare_pointer_type(offset_type_id, argument_storage);
                 SpvFactory::Indices buffer_offset_index_access_indices = {buffer_offset_index_param_id};
                 SpvId buffer_offset_index_access_chain = builder.declare_access_chain(index_ptr_type_id, param_pack_var_id, buffer_offset_index_access_indices);
 

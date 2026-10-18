@@ -38,6 +38,11 @@ struct VulkanMemoryAllocation {
     VkMemoryPropertyFlags properties;
 };
 
+enum VulkanDispatchExtension : uint32_t {
+    VulkanPushDescriptors = 1,
+    VulkanDescriptorTemplates = 2,
+};
+
 /** Vulkan Memory Allocator class interface for managing large
  * memory requests stored as contiguous blocks of memory, which
  * are then sub-allocated into smaller regions of
@@ -90,6 +95,11 @@ public:
     const VkAllocationCallbacks *callbacks() const {
         return this->alloc_callbacks;
     }
+
+    // Custom devices default to the portable descriptor-set path. The default
+    // context sets these only for extensions it actually enabled on the device.
+    uint32_t dispatch_extensions() const { return enabled_dispatch_extensions; }
+    void set_dispatch_extensions(uint32_t extensions) { enabled_dispatch_extensions = extensions; }
 
     static const VulkanMemoryConfig &default_config();
 
@@ -150,6 +160,7 @@ private:
     VkDevice device = nullptr;
     VkPhysicalDevice physical_device = nullptr;
     VkPhysicalDeviceLimits physical_device_limits = {};
+    uint32_t enabled_dispatch_extensions = 0;
     const VkAllocationCallbacks *alloc_callbacks = nullptr;
     BlockAllocator *block_allocator = nullptr;
 };
@@ -201,6 +212,7 @@ int VulkanMemoryAllocator::initialize(void *user_context,
     device = dev;
     physical_device = phys_dev;
     alloc_callbacks = callbacks;
+    enabled_dispatch_extensions = 0;
     region_count = 0;
     region_byte_count = 0;
     block_count = 0;

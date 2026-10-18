@@ -324,7 +324,8 @@ int vk_select_device_for_context(void *user_context,
 }
 
 int vk_create_device(void *user_context, const StringTable &requested_layers, VkInstance *instance, VkDevice *device, VkQueue *queue,
-                     VkPhysicalDevice *physical_device, uint32_t *queue_family_index, const VkAllocationCallbacks *alloc_callbacks) {
+                     VkPhysicalDevice *physical_device, uint32_t *queue_family_index, const VkAllocationCallbacks *alloc_callbacks,
+                     uint32_t *dispatch_extensions) {
     debug(user_context) << " vk_create_device (user_context=" << user_context << ")\n";
 
     // Get the API version to determine what device features are valid to search for
@@ -449,6 +450,8 @@ int vk_create_device(void *user_context, const StringTable &requested_layers, Vk
     }
 
     vk_load_vulkan_device_functions(user_context, *device);
+    *dispatch_extensions = (required_device_extensions.contains(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) ? uint32_t(VulkanPushDescriptors) : 0u) |
+                           ((has_capability_v11 || required_device_extensions.contains(VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_EXTENSION_NAME)) ? uint32_t(VulkanDescriptorTemplates) : 0u);
     if (vkAllocateMemory == nullptr) {
         error(user_context) << "Vulkan: Failed to resolve device API methods for driver!\n";
         return halide_error_code_symbol_not_found;
@@ -500,7 +503,8 @@ int vk_create_context(void *user_context, VulkanMemoryAllocator **allocator,
         return error_code;
     }
 
-    error_code = vk_create_device(user_context, requested_layers, instance, device, queue, physical_device, queue_family_index, alloc_callbacks);
+    uint32_t dispatch_extensions = 0;
+    error_code = vk_create_device(user_context, requested_layers, instance, device, queue, physical_device, queue_family_index, alloc_callbacks, &dispatch_extensions);
     if (error_code != halide_error_code_success) {
         error(user_context) << "Vulkan: Failed to create device for context!\n";
         return error_code;
@@ -512,6 +516,7 @@ int vk_create_context(void *user_context, VulkanMemoryAllocator **allocator,
         return halide_error_code_generic_error;
     }
 
+    (*allocator)->set_dispatch_extensions(dispatch_extensions);
     vk_create_debug_utils_messenger(user_context, *instance, *allocator, messenger);
     return halide_error_code_success;
 }

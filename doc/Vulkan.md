@@ -187,6 +187,21 @@ For JIT apps use the `HL_JIT_TARGET` environment variable:
 $ HL_JIT_TARGET=host-vulkan-vk_int8-vk_int16 ./tutorial/lesson_01_basics
 ```
 
+## Dispatch resource reuse
+
+The runtime reuses descriptor pools and argument storage across synchronized
+command batches. Each pool serves up to 64 dispatches before another pool is
+allocated. Pools are reset only after their commands complete. When the default
+context enables `VK_KHR_push_descriptor`, kernels with up to 32 buffer bindings
+use push descriptors instead. Descriptor update templates are used when available.
+
+Argument blocks of up to 128 bytes use push constants when their scalar types
+and alignment permit it. Larger blocks, and blocks with 8-bit or 16-bit scalar
+arguments, use aligned slices of persistently mapped, coherent uniform-buffer
+pages. Every queued dispatch receives its own argument contents. These pages
+and the descriptor pools are retained until device release; custom contexts
+use the portable descriptor-pool path by default.
+
 ## Useful Runtime Environment Variables
 
 To modify the default behavior of the runtime, the following environment

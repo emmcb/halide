@@ -252,7 +252,12 @@ uint32_t vk_get_optional_device_extensions(void *user_context, uint32_t major_ve
     }
     // Enable presentation only when the driver advertises it.
     ext_table.append(user_context, "VK_KHR_swapchain");
-    return optional_ext_count + 1;
+    ext_table.append(user_context, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    if (major_version == 1 && minor_version == 0) {
+        ext_table.append(user_context, VK_KHR_DESCRIPTOR_UPDATE_TEMPLATE_EXTENSION_NAME);
+        optional_ext_count++;
+    }
+    return optional_ext_count + 2;
 }
 
 uint32_t vk_get_supported_device_extensions(void *user_context, VkPhysicalDevice physical_device, StringTable &ext_table) {
