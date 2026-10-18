@@ -22,6 +22,8 @@
 
 #ifdef WITH_SPIRV
 
+#include <spirv-tools/optimizer.hpp>
+
 namespace Halide {
 namespace Internal {
 
@@ -2986,6 +2988,7 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::declare_device_args(const Stmt &s, uint3
     descriptor_set_table.push_back(descriptor_set);
 }
 
+// Optimize the raw shader before packaging it with Halide's binding metadata.
 void CodeGen_Vulkan_Dev::SPIRV_Emitter::encode_spirv_module(std::vector<char> &module) {
     debug(2) << "CodeGen_Vulkan_Dev::SPIRV_Emitter::encode_spirv_module\n";
 
@@ -3028,6 +3031,27 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::encode_spirv_module(std::vector<char> &m
     // Encode the SPIR-V into a compliant binary
     SpvBinary spirv_binary;
     builder.encode(spirv_binary);
+
+    // Use the same complete performance pass sequence as spirv-opt -O.
+    const spv_target_env environment = target.has_feature(Target::VulkanV13) ? SPV_ENV_VULKAN_1_3 : SPV_ENV_VULKAN_1_0;
+    spvtools::Optimizer optimizer(environment);
+    std::ostringstream optimizer_diagnostics;
+    optimizer.SetMessageConsumer([&](spv_message_level_t, const char *, const spv_position_t &position, const char *message) {
+        optimizer_diagnostics << "word " << position.index << ": " << message << "\n";
+    });
+    optimizer.RegisterPerformancePasses();
+
+    // The runtime's sidecar refers to bindings and specialization constant IDs.
+    // Keep that interface intact while optimizing the shader's implementation.
+    spvtools::OptimizerOptions optimizer_options;
+    optimizer_options.set_preserve_bindings(true);
+    optimizer_options.set_preserve_spec_constants(true);
+
+    SpvBinary optimized_binary;
+    const bool optimized = optimizer.Run(spirv_binary.data(), spirv_binary.size(), &optimized_binary, optimizer_options);
+    user_assert(optimized) << "Vulkan: SPIR-V performance optimization failed:\n"
+                           << optimizer_diagnostics.str();
+    spirv_binary.swap(optimized_binary);
 
     size_t header_bytes = spirv_header.size() * sizeof(uint32_t);
     size_t binary_bytes = spirv_binary.size() * sizeof(uint32_t);

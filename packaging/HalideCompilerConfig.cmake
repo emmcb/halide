@@ -71,6 +71,13 @@ macro(Halide_load_targets type)  # nolint
         Halide_fail("HalideCompiler `${type}` libraries were requested but not found.")
     endif ()
 
+    # SPIRV-Tools exports unnamespaced targets, which the generated dependency
+    # scanner does not discover. Static compiler consumers need these targets.
+    if ("${type}" STREQUAL "static")
+        include(CMakeFindDependencyMacro)
+        find_dependency(SPIRV-Tools-opt CONFIG)
+    endif ()
+
     include("${HalideCompiler_${type}_targets}")
 
     # install(EXPORT)-generated target files define their (non-GLOBAL)

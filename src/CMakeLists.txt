@@ -528,6 +528,11 @@ find_package(SPIRV-Headers 1.5.5 REQUIRED HINTS "${Halide_SOURCE_DIR}/dependenci
 
 target_link_libraries(Halide PRIVATE "$<BUILD_LOCAL_INTERFACE:SPIRV-Headers::SPIRV-Headers>")
 
+# Run the full spirv-opt performance pipeline in the Vulkan code generator.
+find_package(SPIRV-Tools-opt CONFIG REQUIRED)
+
+target_link_libraries(Halide PRIVATE SPIRV-Tools-opt)
+
 target_compile_definitions(Halide PRIVATE WITH_D3D12)
 target_compile_definitions(Halide PRIVATE WITH_METAL)
 target_compile_definitions(Halide PRIVATE WITH_OPENCL)
