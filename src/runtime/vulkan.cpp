@@ -461,6 +461,7 @@ WEAK int halide_vulkan_device_malloc(void *user_context, halide_buffer_t *buf) {
         << "    for halide buffer " << buf << "\n";
 #endif
 
+#if 0
     // retrieve the buffer from the region
     VkBuffer *device_buffer = reinterpret_cast<VkBuffer *>(device_region->handle);
     if (device_buffer == nullptr) {
@@ -478,6 +479,9 @@ WEAK int halide_vulkan_device_malloc(void *user_context, halide_buffer_t *buf) {
     if (error_code != halide_error_code_success) {
         error(user_context) << "Vulkan: Failed to clear device buffer!\n";
     }
+#else
+    int error_code = halide_error_code_success;
+#endif
 
 #ifdef DEBUG_RUNTIME
     debug(user_context) << "Vulkan: Reserved memory for device region ("
@@ -493,12 +497,6 @@ WEAK int halide_vulkan_device_malloc(void *user_context, halide_buffer_t *buf) {
 }
 
 WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halide_buffer) {
-    int error_code = halide_vulkan_device_malloc(user_context, halide_buffer);
-    if (error_code != halide_error_code_success) {
-        error(user_context) << "Vulkan: Failed to allocate device memory!\n";
-        return error_code;
-    }
-
     debug(user_context)
         << "halide_vulkan_copy_to_device (user_context: " << user_context
         << ", halide_buffer: " << halide_buffer << ")\n";
@@ -560,7 +558,7 @@ WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halid
     }
 
     // unmap the pointer
-    error_code = ctx.allocator->unmap(user_context, staging_region);
+    int error_code = ctx.allocator->unmap(user_context, staging_region);
     if (error_code != halide_error_code_success) {
         error(user_context) << "Vulkan: Failed to unmap host pointer to device memory!\n";
         return error_code;
