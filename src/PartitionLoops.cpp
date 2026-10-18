@@ -256,6 +256,7 @@ class FindSimplifications : public IRVisitor {
     Scope<> depends_on_loop_var, depends_on_invalid_buffers;
     Scope<> vars_with_uncaptured_likely, vars_with_likely;
     Scope<> buffers;
+    bool include_loop_invariant_conditions;
 
     void visit(const Allocate *op) override {
         buffers.push(op->name);
@@ -263,7 +264,8 @@ class FindSimplifications : public IRVisitor {
     }
 
     void new_simplification(Expr condition, Expr old, Expr likely_val, Expr unlikely_val) {
-        if (!expr_uses_vars(condition, depends_on_loop_var)) {
+        if (!include_loop_invariant_conditions &&
+            !expr_uses_vars(condition, depends_on_loop_var)) {
             return;
         }
 
@@ -394,6 +396,12 @@ class FindSimplifications : public IRVisitor {
     }
 
     void visit(const For *op) override {
+        // An explicitly guarded nest owns its boundary decisions. Enclosing
+        // automatic partitioning must not consume its likely expressions.
+        if (!include_loop_invariant_conditions && op->partition_policy == Partition::GuardWithIf) {
+            return;
+        }
+
         vector<Simplification> old;
         old.swap(simplifications);
         IRVisitor::visit(op);
@@ -468,7 +476,9 @@ class FindSimplifications : public IRVisitor {
 public:
     vector<Simplification> simplifications;
 
-    FindSimplifications(const std::string &v) {
+    // Guarded nests also need conditions involving only outer coordinates.
+    FindSimplifications(const std::string &v, bool include_invariant = false)
+        : include_loop_invariant_conditions(include_invariant) {
         depends_on_loop_var.push(v);
     }
 };
@@ -530,13 +540,176 @@ bool contains_warp_synchronous_logic(const Stmt &s) {
     return c.result;
 }
 
+bool expr_contains_load(const Expr &e);
+
+// Split conjunctions and conjunctive min/max comparisons into simple tests.
+void collect_partition_predicates(const Expr &condition, vector<Expr> &predicates) {
+    if (const And *op = condition.as<And>()) {
+        collect_partition_predicates(op->a, predicates);
+        collect_partition_predicates(op->b, predicates);
+        return;
+    }
+
+    Expr a, b;
+    bool strict = false;
+    if (const LE *op = condition.as<LE>()) {
+        a = op->a;
+        b = op->b;
+    } else if (const LT *op = condition.as<LT>()) {
+        a = op->a;
+        b = op->b;
+        strict = true;
+    }
+
+    if (a.defined()) {
+        if (const Min *op = b.as<Min>()) {
+            collect_partition_predicates(strict ? a < op->a : a <= op->a, predicates);
+            collect_partition_predicates(strict ? a < op->b : a <= op->b, predicates);
+            return;
+        }
+        if (const Max *op = a.as<Max>()) {
+            collect_partition_predicates(strict ? op->a < b : op->a <= b, predicates);
+            collect_partition_predicates(strict ? op->b < b : op->b <= b, predicates);
+            return;
+        }
+    }
+
+    predicates.push_back(simplify(condition));
+}
+
+// Prove implication by comparing solved intervals, without adding runtime divides.
+bool partition_predicate_implies(const Expr &stronger, const Expr &weaker,
+                                 const Scope<Interval> &bounds) {
+    vector<string> variables;
+    bool has_let = false;
+    auto collect_variable = [&](auto *, const Variable *op) {
+        if (op->type == Int(32)) {
+            variables.push_back(op->name);
+        }
+    };
+    auto reject_let = [&](auto *self, const Let *op) {
+        has_let = true;
+        self->visit_base(op);
+    };
+    visit_with(weaker, collect_variable, reject_let);
+    if (has_let) {
+        return false;
+    }
+
+    std::sort(variables.begin(), variables.end());
+    variables.erase(std::unique(variables.begin(), variables.end()), variables.end());
+    for (const string &variable : variables) {
+        Interval outer = solve_for_outer_interval(stronger, variable);
+        Interval inner = solve_for_inner_interval(weaker, variable);
+        if (outer.is_empty()) {
+            return true;
+        }
+        if (inner.is_empty()) {
+            continue;
+        }
+
+        bool lower_implied = !inner.has_lower_bound() ||
+                             (outer.has_lower_bound() && can_prove(inner.min <= outer.min, bounds));
+        bool upper_implied = !inner.has_upper_bound() ||
+                             (outer.has_upper_bound() && can_prove(outer.max <= inner.max, bounds));
+        if (lower_implied && upper_implied) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Remove duplicate and implied predicates before emitting a single nest guard.
+Expr simplify_partition_guard(const Expr &guard, const Scope<Interval> &loop_bounds) {
+    vector<Expr> predicates;
+    collect_partition_predicates(simplify(guard), predicates);
+    std::sort(predicates.begin(), predicates.end(), IRDeepCompare());
+    predicates.erase(std::unique(predicates.begin(), predicates.end(),
+                                 [](const Expr &a, const Expr &b) { return equal(a, b); }),
+                     predicates.end());
+
+    vector<string> variables;
+    auto collect_variable = [&](auto *, const Variable *op) {
+        if (op->type == Int(32)) {
+            variables.push_back(op->name);
+        }
+    };
+    auto skip_let = [](auto *, const Let *) {};
+    visit_with(guard, collect_variable, skip_let);
+    std::sort(variables.begin(), variables.end());
+    variables.erase(std::unique(variables.begin(), variables.end()), variables.end());
+
+    // Each predicate can be simplified under the remaining predicates. Updating
+    // one at a time preserves the conjunction, even when several imply each other.
+    for (size_t i = 0; i < predicates.size();) {
+        vector<Expr> assumptions = predicates;
+        assumptions.erase(assumptions.begin() + i);
+
+        // Constant bounds from other predicates expose facts such as a positive
+        // extent implied by a nonnegative origin and a valid upper footprint.
+        // Keep symbolic relationships in the predicates to avoid cyclic bounds.
+        Scope<Interval> bounds;
+        bounds.set_containing_scope(&loop_bounds);
+        for (const string &variable : variables) {
+            Interval interval;
+            if (const Interval *outer = loop_bounds.find(variable)) {
+                interval = *outer;
+            }
+            for (const Expr &assumption : assumptions) {
+                Interval implied_interval = solve_for_outer_interval(assumption, variable);
+                if (!is_const(implied_interval.min)) {
+                    implied_interval.min = Interval::neg_inf();
+                }
+                if (!is_const(implied_interval.max)) {
+                    implied_interval.max = Interval::pos_inf();
+                }
+                interval = Interval::make_intersection(interval, implied_interval);
+            }
+            bounds.push(variable, interval);
+        }
+
+        bool implied = false;
+        for (const Expr &assumption : assumptions) {
+            if (partition_predicate_implies(assumption, predicates[i], bounds)) {
+                implied = true;
+                break;
+            }
+        }
+        Expr reduced = implied ? const_true() : simplify(predicates[i], bounds, Scope<ModulusRemainder>::empty_scope(), assumptions);
+        if (is_const_zero(reduced)) {
+            return const_false();
+        }
+        if (is_const_one(reduced)) {
+            predicates.erase(predicates.begin() + i);
+        } else {
+            predicates[i] = reduced;
+            ++i;
+        }
+    }
+
+    Expr result = const_true();
+    for (const Expr &predicate : predicates) {
+        result = result && predicate;
+    }
+    return simplify(common_subexpression_elimination(result));
+}
+
 class PartitionLoops : public IRMutator {
     using IRMutator::visit;
 
     bool in_gpu_loop = false;
     bool in_tail = false;
+    Scope<Interval> loop_bounds;
 
     Stmt visit(const For *op) override {
+        // Track GPU scope even through loops whose partition policy is Never.
+        ScopedValue<bool> old_in_gpu_loop(in_gpu_loop, in_gpu_loop || is_gpu(op->for_type));
+        ScopedBinding<Interval> bind_loop_bounds(loop_bounds, op->name, Interval(op->min, op->max));
+
+        if (op->partition_policy == Partition::GuardWithIf) {
+            return guard_loop_nest(op);
+        }
+
         // Do not partition if the schedule explicitly forbids, or if it's set
         // to automatic and we're in a loop tail.
         if (op->partition_policy == Partition::Never ||
@@ -550,11 +723,60 @@ class PartitionLoops : public IRMutator {
         return loop;
     }
 
+    // Version the whole selected nest using conditions valid for all iterations.
+    Stmt guard_loop_nest(const For *op) {
+        Stmt general = remove_likelies(Stmt(op));
+        if (in_gpu_loop && contains_warp_synchronous_logic(op)) {
+            return general;
+        }
+
+        // Visiting the selected loop itself relaxes its coordinate as well as
+        // all descendant coordinates out of the conditions. Outer coordinates
+        // remain available, including those unrelated to the selected variable.
+        FindSimplifications finder(op->name, true);
+        op->accept(&finder);
+
+        vector<Simplification> simplifications;
+        Expr guard = const_true();
+        for (auto &s : finder.simplifications) {
+            while (s.condition.type().is_vector()) {
+                s.condition = simplify(s.condition);
+                if (const Broadcast *b = s.condition.as<Broadcast>()) {
+                    s.condition = b->value;
+                } else {
+                    s.condition = and_condition_over_domain(s.condition, Scope<Interval>::empty_scope());
+                }
+            }
+
+            // Memory may change during the nest, and an impure call must not be
+            // moved to a different execution point. Keep those tests in place.
+            if (!is_pure(s.condition) || expr_contains_load(s.condition)) {
+                continue;
+            }
+
+            guard = guard && s.condition;
+            simplifications.push_back(std::move(s));
+        }
+
+        guard = simplify_partition_guard(guard, loop_bounds);
+        if (simplifications.empty() || is_const_zero(guard) ||
+            !is_pure(guard) || expr_contains_load(guard)) {
+            return general;
+        }
+
+        // Preserve reduction order and bounds in both versions. Do not recurse:
+        // partitioning either version would recreate multiple boundary bodies.
+        Stmt steady = remove_likelies(MakeSimplifications(simplifications).mutate(Stmt(op)));
+        if (is_const_one(guard)) {
+            return steady;
+        }
+
+        return IfThenElse::make(guard, steady, general);
+    }
+
     std::tuple<Stmt, bool> visit_for(const For *op) {
         bool mutated = false;
         Stmt body = op->body;
-
-        ScopedValue<bool> old_in_gpu_loop(in_gpu_loop, in_gpu_loop || is_gpu(op->for_type));
 
         // If we're inside GPU kernel, and the body contains thread
         // barriers or warp shuffles, it's not safe to partition loops.

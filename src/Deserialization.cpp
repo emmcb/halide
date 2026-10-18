@@ -228,6 +228,8 @@ Partition Deserializer::deserialize_partition(Serialize::Partition partition) {
         return Halide::Partition::Never;
     case Serialize::Partition::Always:
         return Halide::Partition::Always;
+    case Serialize::Partition::GuardWithIf:
+        return Halide::Partition::GuardWithIf;
     default:
         user_error << "unknown loop partition policy " << (int)partition << "\n";
         return Halide::Partition::Auto;

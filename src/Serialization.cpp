@@ -198,6 +198,8 @@ Serialize::Partition Serializer::serialize_partition(const Partition &partition)
         return Serialize::Partition::Never;
     case Halide::Partition::Always:
         return Serialize::Partition::Always;
+    case Halide::Partition::GuardWithIf:
+        return Serialize::Partition::GuardWithIf;
     default:
         user_error << "Unsupported loop partition policy\n";
         return Serialize::Partition::Auto;

@@ -234,6 +234,9 @@ std::ostream &operator<<(std::ostream &out, const Partition &p) {
     case Partition::Always:
         out << "Always";
         break;
+    case Partition::GuardWithIf:
+        out << "GuardWithIf";
+        break;
     }
     return out;
 }

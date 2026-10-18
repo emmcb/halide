@@ -23,7 +23,14 @@ enum class Partition {
     /** Force partitioning of the loop, even in the tail cases of outer
      * partitioned loops. If Halide can't find a way to partition this loop, it
      * will raise an error. */
-    Always
+    Always,
+
+    /** Version this loop and its descendants into a simplified steady case and
+     * the original general case, with one condition outside the selected loop.
+     * The condition must hold over every iteration of the selected nest.
+     * Neither version is partitioned further. If no safe, useful guard can be
+     * formed, retain the original nest. GPU synchronization restrictions apply. */
+    GuardWithIf
 };
 
 }  // namespace Halide

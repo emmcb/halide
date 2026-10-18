@@ -1651,8 +1651,11 @@ public:
 
     /** Set the loop partition policy. Loop partitioning can be useful to
      * optimize boundary conditions (such as clamp_edge). Loop partitioning
-     * splits a for loop into three for loops: a prologue, a steady-state,
-     * and an epilogue.
+     * normally splits a for loop into a prologue, a steady-state, and an
+     * epilogue. Partition::GuardWithIf instead versions the selected loop nest
+     * into a steady case and the original general case, guarded outside the
+     * selected loop by one condition covering every iteration of the nest.
+     * Neither version is partitioned further.
      * The default policy is Auto. */
     Func &partition(const VarOrRVar &var, Partition partition_policy);
 

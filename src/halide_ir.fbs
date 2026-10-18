@@ -90,6 +90,7 @@ enum Partition: byte {
     Auto,
     Never,
     Always,
+    GuardWithIf,
 }
 
 enum DeviceAPI: byte {

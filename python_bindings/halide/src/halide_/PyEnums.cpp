@@ -312,7 +312,8 @@ void define_enums(py::module &m) {
     py::enum_<Partition>(m, "Partition")
         .value("Auto", Partition::Auto)
         .value("Never", Partition::Never)
-        .value("Always", Partition::Always);
+        .value("Always", Partition::Always)
+        .value("GuardWithIf", Partition::GuardWithIf);
 }
 
 }  // namespace PythonBindings
