@@ -712,6 +712,15 @@ inline Expr max(Expr a, float b) {
     return max(std::move(a), Expr(b));
 }
 
+#ifdef HALIDE_CPP_COMPILER_HAS_FLOAT16
+inline Expr max(_Float16 a, Expr b) {
+    return max(Expr(a), std::move(b));
+}
+inline Expr max(Expr a, _Float16 b) {
+    return max(std::move(a), Expr(b));
+}
+#endif
+
 /** Returns an expression representing the greater of an expressions
  * vector, after doing any necessary type coercion using
  * \ref Internal::match_types. Vectorizes cleanly on most platforms
@@ -746,6 +755,15 @@ inline Expr min(float a, Expr b) {
 inline Expr min(Expr a, float b) {
     return min(std::move(a), Expr(b));
 }
+
+#ifdef HALIDE_CPP_COMPILER_HAS_FLOAT16
+inline Expr min(_Float16 a, Expr b) {
+    return min(Expr(a), std::move(b));
+}
+inline Expr min(Expr a, _Float16 b) {
+    return min(std::move(a), Expr(b));
+}
+#endif
 
 /** Returns an expression representing the lesser of an expressions
  * vector, after doing any necessary type coercion using
@@ -830,6 +848,77 @@ inline Expr operator!=(float a, Expr b) {
     return Expr(a) != std::move(b);
 }
 // @}
+
+#ifdef HALIDE_CPP_COMPILER_HAS_FLOAT16
+// @{
+inline Expr operator+(Expr a, _Float16 b) {
+    return std::move(a) + Expr(b);
+}
+inline Expr operator+(_Float16 a, Expr b) {
+    return Expr(a) + std::move(b);
+}
+inline Expr operator-(Expr a, _Float16 b) {
+    return std::move(a) - Expr(b);
+}
+inline Expr operator-(_Float16 a, Expr b) {
+    return Expr(a) - std::move(b);
+}
+inline Expr operator*(Expr a, _Float16 b) {
+    return std::move(a) * Expr(b);
+}
+inline Expr operator*(_Float16 a, Expr b) {
+    return Expr(a) * std::move(b);
+}
+inline Expr operator/(Expr a, _Float16 b) {
+    return std::move(a) / Expr(b);
+}
+inline Expr operator/(_Float16 a, Expr b) {
+    return Expr(a) / std::move(b);
+}
+inline Expr operator%(Expr a, _Float16 b) {
+    return std::move(a) % Expr(b);
+}
+inline Expr operator%(_Float16 a, Expr b) {
+    return Expr(a) % std::move(b);
+}
+inline Expr operator>(Expr a, _Float16 b) {
+    return std::move(a) > Expr(b);
+}
+inline Expr operator>(_Float16 a, Expr b) {
+    return Expr(a) > std::move(b);
+}
+inline Expr operator<(Expr a, _Float16 b) {
+    return std::move(a) < Expr(b);
+}
+inline Expr operator<(_Float16 a, Expr b) {
+    return Expr(a) < std::move(b);
+}
+inline Expr operator>=(Expr a, _Float16 b) {
+    return std::move(a) >= Expr(b);
+}
+inline Expr operator>=(_Float16 a, Expr b) {
+    return Expr(a) >= std::move(b);
+}
+inline Expr operator<=(Expr a, _Float16 b) {
+    return std::move(a) <= Expr(b);
+}
+inline Expr operator<=(_Float16 a, Expr b) {
+    return Expr(a) <= std::move(b);
+}
+inline Expr operator==(Expr a, _Float16 b) {
+    return std::move(a) == Expr(b);
+}
+inline Expr operator==(_Float16 a, Expr b) {
+    return Expr(a) == std::move(b);
+}
+inline Expr operator!=(Expr a, _Float16 b) {
+    return std::move(a) != Expr(b);
+}
+inline Expr operator!=(_Float16 a, Expr b) {
+    return Expr(a) != std::move(b);
+}
+// @}
+#endif
 
 /** Clamps an expression to lie within the given bounds. The bounds
  * are type-cast to match the expression. Vectorizes as well as min/max. */

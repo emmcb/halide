@@ -347,7 +347,7 @@ struct Expr : public Internal::IRHandle {
         : IRHandle(Internal::FloatImm::make(BFloat(16), (double)x)) {
     }
 #if HALIDE_CPP_COMPILER_HAS_FLOAT16
-    explicit Expr(_Float16 x)
+    Expr(_Float16 x)
         : IRHandle(Internal::FloatImm::make(Float(16), (double)x)) {
     }
 #endif
