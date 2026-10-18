@@ -61,4 +61,13 @@ if (NOT MSVC)
 
     # string_table.cpp
     halide_define_runtime_internal_test(string_table)
+
+    # The mock Vulkan driver exercises the complete device interface, so link
+    # the host runtime for its synchronization and buffer management functions.
+    find_package(VulkanHeaders 1.3.296 REQUIRED HINTS "${Halide_SOURCE_DIR}/dependencies/vulkan")
+    add_halide_runtime(vulkan_transfers_runtime TARGETS "${Halide_CMAKE_TARGET}")
+    add_executable(runtime_internal_vulkan_transfers vulkan_transfers.cpp)
+    _set_target_options(runtime_internal_vulkan_transfers)
+    target_link_libraries(runtime_internal_vulkan_transfers PRIVATE Halide::Test Vulkan::Headers vulkan_transfers_runtime)
+    add_halide_test(runtime_internal_vulkan_transfers GROUPS runtime_internal)
 endif ()

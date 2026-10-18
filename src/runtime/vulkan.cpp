@@ -89,6 +89,86 @@ namespace Vulkan {
 WEAK halide_vulkan_acquire_context_t acquire_context = halide_default_vulkan_acquire_context;
 WEAK halide_vulkan_release_context_t release_context = halide_default_vulkan_release_context;
 
+namespace {
+
+bool vk_can_copy_mapped(void *user_context, VulkanMemoryAllocator *allocator, MemoryRegion *region) {
+    const VulkanMemoryAllocation *allocation = allocator->allocation_for(user_context, region);
+    const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    return allocation && ((allocation->properties & required) == required);
+}
+
+// Coherent device-local memory can be copied directly, without a staging
+// buffer. Context access serializes mappings of the same memory block.
+int vk_copy_mapped(void *user_context, const VulkanContext &ctx, MemoryRegion *region,
+                   device_copy copy, bool to_host, uint32_t element_size) {
+    if (to_host) {
+        // Waiting for the queue alone does not make shader/transfer writes
+        // visible to the host. Submit a device-to-host memory dependency first.
+        ScopedVulkanCommandBufferAndPool cmds(user_context, ctx.allocator, ctx.queue_family_index);
+        if (cmds.error_code != halide_error_code_success) {
+            return cmds.error_code;
+        }
+        VkCommandBufferBeginInfo begin_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VkResult result = vkBeginCommandBuffer(cmds.command_buffer, &begin_info);
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkBeginCommandBuffer returned " << vk_get_error_name(result) << "\n";
+            return halide_error_code_device_buffer_copy_failed;
+        }
+        VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cmds.command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 1, &barrier, 0, nullptr, 0, nullptr);
+        result = vkEndCommandBuffer(cmds.command_buffer);
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkEndCommandBuffer returned " << vk_get_error_name(result) << "\n";
+            return halide_error_code_device_buffer_copy_failed;
+        }
+        int error_code = vk_submit_command_buffer(user_context, ctx.queue, cmds.command_buffer);
+        if (error_code != halide_error_code_success) {
+            return error_code;
+        }
+        // Keep the command buffer alive until it has finished executing.
+        result = vkQueueWaitIdle(ctx.queue);
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
+            return halide_error_code_device_buffer_copy_failed;
+        }
+    } else {
+        VkResult result = vkQueueWaitIdle(ctx.queue);
+        if (result != VK_SUCCESS) {
+            error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
+            return halide_error_code_device_buffer_copy_failed;
+        }
+    }
+
+    const VulkanMemoryAllocation *allocation = ctx.allocator->allocation_for(user_context, region);
+    // Map the whole block to include suballocations and cropped buffers.
+    void *mapped = nullptr;
+    VkResult result = vkMapMemory(ctx.device, allocation->memory, 0, VK_WHOLE_SIZE, 0, &mapped);
+    if (result != VK_SUCCESS) {
+        error(user_context) << "Vulkan: vkMapMemory returned " << vk_get_error_name(result) << "\n";
+        return halide_error_code_device_buffer_copy_failed;
+    }
+    MemoryRegion *owner = ctx.allocator->owner_of(user_context, region);
+    uint64_t device_ptr = (uint64_t)mapped + owner->allocation.offset +
+                          (int64_t)region->indexing.offset * element_size;
+    if (to_host) {
+        copy.src = device_ptr;
+    } else {
+        copy.dst = device_ptr;
+    }
+    copy_memory(copy, user_context);
+    vkUnmapMemory(ctx.device, allocation->memory);
+    // Queue submission makes these host writes visible to subsequent device
+    // operations; no additional host-to-device pipeline barrier is needed.
+    return halide_error_code_success;
+}
+
+}  // namespace
+
 }  // namespace Vulkan
 }  // namespace Internal
 }  // namespace Runtime
@@ -355,7 +435,8 @@ WEAK int halide_vulkan_device_malloc(void *user_context, halide_buffer_t *buf) {
     uint64_t t_before = halide_current_time_ns(user_context);
 #endif
 
-    // request uncached device only memory
+    // Request device-local memory; the allocator prefers a host-visible type
+    // so transfers can bypass staging when the device supports it.
     MemoryRequest request = {0};
     request.size = size;
     request.properties.usage = MemoryUsage::TransferSrcDst;
@@ -438,6 +519,11 @@ WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halid
         return halide_error_code_internal_error;
     }
     device_copy copy_helper = make_host_to_device_copy(halide_buffer);
+
+    MemoryRegion *mapped_region = reinterpret_cast<MemoryRegion *>(halide_buffer->device);
+    if (vk_can_copy_mapped(user_context, ctx.allocator, mapped_region)) {
+        return vk_copy_mapped(user_context, ctx, mapped_region, copy_helper, false, halide_buffer->type.bytes());
+    }
 
     // We construct a staging buffer to copy into from host memory.  Then,
     // we use vkCmdCopyBuffer() to copy from the staging buffer into the
@@ -627,6 +713,11 @@ WEAK int halide_vulkan_copy_to_host(void *user_context, halide_buffer_t *halide_
     }
 
     device_copy copy_helper = make_device_to_host_copy(halide_buffer);
+
+    MemoryRegion *mapped_region = reinterpret_cast<MemoryRegion *>(halide_buffer->device);
+    if (vk_can_copy_mapped(user_context, ctx.allocator, mapped_region)) {
+        return vk_copy_mapped(user_context, ctx, mapped_region, copy_helper, true, halide_buffer->type.bytes());
+    }
 
     // This is the inverse of copy_to_device: we create a staging buffer, copy into
     // it, map it so the host can see it, then copy into the host buffer
@@ -836,6 +927,13 @@ WEAK int halide_vulkan_buffer_copy(void *user_context, struct halide_buffer_t *s
 #ifdef DEBUG_RUNTIME
         uint64_t t_before = halide_current_time_ns(user_context);
 #endif
+        if (from_host != to_host) {
+            MemoryRegion *mapped_region = reinterpret_cast<MemoryRegion *>(to_host ? src->device : dst->device);
+            if (vk_can_copy_mapped(user_context, ctx.allocator, mapped_region)) {
+                return vk_copy_mapped(user_context, ctx, mapped_region, copy_helper, to_host, src->type.bytes());
+            }
+        }
+
         MemoryRegion *staging_region = nullptr;
         MemoryRegion *src_buffer_region = nullptr;
         MemoryRegion *dst_buffer_region = nullptr;
