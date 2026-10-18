@@ -1968,6 +1968,27 @@ void check_boolean() {
     // A for loop where the min equals the max is just the body
     check(IfThenElse::make(x == 0, loop), IfThenElse::make(x == 0, body));
 
+    // Symbolic loop bounds imply the bounds guards used by compute_with.
+    // Keep stricter guards: those still exclude valid iterations of the loop.
+    {
+        Expr t = Variable::make(Int(32), "t");
+        Expr loop_min = simplify(x / 8 + 1);
+        Expr loop_max = simplify(y / 8 - 1);
+        Stmt body = not_no_op(t);
+        for (ForType type : {ForType::Serial, ForType::Parallel, ForType::GPUBlock, ForType::GPUThread}) {
+            DeviceAPI api = is_gpu(type) ? DeviceAPI::OpenCL : DeviceAPI::None;
+            Stmt expected = For::make("t", loop_min, loop_max, type, Partition::Auto, api, body);
+            check(For::make("t", loop_min, loop_max, type, Partition::Auto, api,
+                            IfThenElse::make(likely(t >= loop_min) && likely(t <= loop_max), body)),
+                  expected);
+            for (Expr condition : {t >= loop_min + 1, t <= loop_max - 1}) {
+                Stmt guarded_body = simplify(IfThenElse::make(condition, body));
+                Stmt guarded_loop = For::make("t", loop_min, loop_max, type, Partition::Auto, api, guarded_body);
+                check(guarded_loop, guarded_loop);
+            }
+        }
+    }
+
     // Check we can learn from conditions on variables
     check(IfThenElse::make(x < 5, not_no_op(min(x, 17))),
           IfThenElse::make(x < 5, not_no_op(x)));

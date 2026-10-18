@@ -253,6 +253,11 @@ Stmt Simplify::visit(const For *op) {
         ScopedFact fact_loop_var_le_max = scoped_truth(loop_var <= new_max);
         ScopedFact fact_loop_var_ge_min = scoped_truth(new_min <= loop_var);
 
+        // Comparisons simplify through LT, so also learn the canonical negations.
+        // Otherwise equivalent guards can survive when the loop bounds are symbolic.
+        ScopedFact fact_loop_var_gt_max = scoped_falsehood(mutate(new_max < loop_var, nullptr));
+        ScopedFact fact_loop_var_lt_min = scoped_falsehood(mutate(loop_var < new_min, nullptr));
+
         new_body = mutate(op->body);
     }
 
