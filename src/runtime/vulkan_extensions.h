@@ -144,7 +144,9 @@ uint32_t vk_get_required_instance_extensions(void *user_context, StringTable &ex
 uint32_t vk_get_optional_instance_extensions(void *user_context, StringTable &ext_table) {
     const char *optional_ext_table[] = {
         VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,  //< promoted to core in v1.1
-        VK_EXT_DEBUG_UTILS_EXTENSION_NAME};                      //< optional on all versions
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
+        "VK_KHR_surface",
+        "VK_KHR_android_surface"};                      //< optional on all versions
     const uint32_t optional_ext_count = sizeof(optional_ext_table) / sizeof(optional_ext_table[0]);
     ext_table.fill(user_context, (const char **)optional_ext_table, optional_ext_count);
     return optional_ext_count;
@@ -248,7 +250,9 @@ uint32_t vk_get_optional_device_extensions(void *user_context, uint32_t major_ve
             optional_ext_count = v1p3_ext_count;
         }
     }
-    return optional_ext_count;
+    // Enable presentation only when the driver advertises it.
+    ext_table.append(user_context, "VK_KHR_swapchain");
+    return optional_ext_count + 1;
 }
 
 uint32_t vk_get_supported_device_extensions(void *user_context, VkPhysicalDevice physical_device, StringTable &ext_table) {

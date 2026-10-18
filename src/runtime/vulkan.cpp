@@ -1425,6 +1425,28 @@ WEAK uintptr_t halide_vulkan_get_vk_buffer(void *user_context, halide_buffer_t *
     return (uintptr_t)buf->device;
 }
 
+// Borrow the allocation's native handle without exposing the allocator's internal layout.
+WEAK int halide_vulkan_get_native_buffer(void *user_context, const halide_buffer_t *buf,
+                                        uint64_t *buffer, uint64_t *offset) {
+    if (!buf || !buffer || !offset || !buf->device ||
+        buf->device_interface != &vulkan_device_interface) {
+        return halide_error_code_incompatible_device_interface;
+    }
+    VulkanContext ctx(user_context);
+    if (ctx.error != halide_error_code_success) {
+        return ctx.error;
+    }
+    MemoryRegion *region = reinterpret_cast<MemoryRegion *>(buf->device);
+    MemoryRegion *owner = ctx.allocator->owner_of(user_context, region);
+    if (!owner || !owner->handle || region->indexing.offset < 0) {
+        return halide_error_code_internal_error;
+    }
+    *buffer = (uint64_t)*reinterpret_cast<VkBuffer *>(owner->handle);
+    // Each VkBuffer is already bound at the owner's allocation offset.
+    *offset = (uint64_t)region->indexing.offset * buf->type.bytes();
+    return halide_error_code_success;
+}
+
 WEAK const struct halide_device_interface_t *halide_vulkan_device_interface() {
     return &vulkan_device_interface;
 }

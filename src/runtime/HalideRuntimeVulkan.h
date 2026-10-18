@@ -49,6 +49,13 @@ HALIDE_VULKAN_DEFINE_NON_DISPATCHABLE_HANDLE(VkDebugUtilsMessengerEXT)
 
 extern const struct halide_device_interface_t *halide_vulkan_device_interface();
 
+/** Borrow a native VkBuffer and byte offset from a live Halide allocation.
+ * The caller must retain the Halide buffer and synchronize accesses on the
+ * queue returned by halide_vulkan_acquire_context. Does not transfer ownership. */
+extern int halide_vulkan_get_native_buffer(void *user_context,
+                                           const struct halide_buffer_t *buf,
+                                           uint64_t *buffer, uint64_t *offset);
+
 /** These are forward declared here to allow clients to override the
  *  Halide Vulkan runtime. Do not call them. */
 // @{
