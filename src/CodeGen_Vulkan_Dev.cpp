@@ -1237,7 +1237,9 @@ void CodeGen_Vulkan_Dev::SPIRV_Emitter::visit(const Call *op) {
             weight = floor(weight * op->type.max()) / op->type.max();
         }
 
-        Type result_type = Float(32, op->type.lanes());
+        // The emitted value must match the intrinsic's floating-point type so
+        // enclosing expressions see the correct width, including nested lerps.
+        Type result_type = op->type.is_float() ? op->type : Float(32, op->type.lanes());
         Expr e = Call::make(result_type, "mix", {zero_val, one_val, weight}, Call::Extern);
 
         if (!op->type.is_float()) {
