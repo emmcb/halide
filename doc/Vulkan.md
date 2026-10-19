@@ -189,6 +189,14 @@ $ HL_JIT_TARGET=host-vulkan-vk_int8-vk_int16 ./tutorial/lesson_01_basics
 
 ## Dispatch resource reuse
 
+Mapped readback adds a host-read memory dependency to the pending command batch
+and submits and waits once. Later mapped readbacks on the same allocator and
+queue reuse that completed dependency until new GPU work invalidates it. If
+device synchronization already completed a batch without a host dependency,
+the first mapped readback submits a barrier-only batch. Submission and wait
+failures retain the batch for retry without marking its memory ready for host
+reads.
+
 The runtime reuses descriptor pools and argument storage across synchronized
 command batches. Each pool serves up to 64 dispatches before another pool is
 allocated. Pools are reset only after their commands complete. When the default

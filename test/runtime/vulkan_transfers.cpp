@@ -22,8 +22,9 @@ struct TestBuffer {
 VkPhysicalDeviceMemoryProperties memory_properties;
 VulkanMemoryAllocator *allocator;
 VkDevice test_device = (VkDevice)1;
+VkQueue test_queue = (VkQueue)1;
 bool reject_unified_allocation;
-int copies, maps, unmaps, barriers, flushes, invalidates, waits;
+int copies, maps, unmaps, barriers, host_barriers, flushes, invalidates, waits;
 int submissions, recorded_dispatches, executed_dispatches, pools_created, pools_destroyed;
 int descriptor_sets, descriptor_pools, descriptor_pools_created, descriptor_pools_reset, pipelines, pipelines_created;
 VkResult pipeline_result = VK_SUCCESS;
@@ -97,7 +98,7 @@ void *allocate_zeroed(size_t size) {
 #define check(condition) HALIDE_CHECK(nullptr, condition)
 
 void reset_counts() {
-    copies = maps = unmaps = barriers = flushes = invalidates = waits = 0;
+    copies = maps = unmaps = barriers = host_barriers = flushes = invalidates = waits = 0;
     submissions = recorded_dispatches = executed_dispatches = pools_created = pools_destroyed = 0;
 }
 
@@ -508,8 +509,15 @@ VKAPI_ATTR void VKAPI_CALL pipeline_barrier(VkCommandBuffer, VkPipelineStageFlag
         check(src == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && barrier->srcAccessMask == VK_ACCESS_MEMORY_WRITE_BIT);
         check(barrier->dstAccessMask == (VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT));
     } else {
-        check(src == (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT) && dst == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        check(src == (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT));
+        check(dst == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT || dst == (VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT));
         check(barrier->srcAccessMask == (VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT) && (barrier->dstAccessMask & VK_ACCESS_MEMORY_READ_BIT));
+    }
+    if (dst & VK_PIPELINE_STAGE_HOST_BIT) {
+        check(barrier->dstAccessMask & VK_ACCESS_HOST_READ_BIT);
+        host_barriers++;
+    } else {
+        check(!(barrier->dstAccessMask & VK_ACCESS_HOST_READ_BIT));
     }
 }
 
@@ -540,7 +548,7 @@ int acquire(void *, halide_vulkan_memory_allocator **out_allocator, VkInstance *
     *instance = (VkInstance)1;
     *device = test_device;
     *physical_device = (VkPhysicalDevice)1;
-    *queue = (VkQueue)1;
+    *queue = test_queue;
     *family = 0;
     *messenger = VK_NULL_HANDLE;
     return halide_error_code_success;
@@ -640,9 +648,17 @@ void test_transfers(bool coherent, bool unified, bool reject_allocation = false,
     reset_counts();
     check(halide_vulkan_buffer_copy(nullptr, &host_buffer, &vulkan_device_interface, &buffer) == 0);
     check((copies == 0) == mapped);
+    if (mapped) {
+        check(submissions == 0 && waits == 0);
+    }
     reset_counts();
     check(halide_vulkan_buffer_copy(nullptr, &buffer, nullptr, &host_buffer) == 0);
     check((copies == 0) == mapped);
+    if (mapped) {
+        // The previous readback covers all allocations, including direct host
+        // writes, until another GPU operation writes memory on this queue.
+        check(submissions == 0 && waits == 0 && host_barriers == 0);
+    }
 
     // Device copies preserve multidimensional strides in a deferred batch.
     int32_t destination_host[24];
@@ -690,7 +706,7 @@ void test_transfers(bool coherent, bool unified, bool reject_allocation = false,
         check(copies == 0 && maps == 1 && unmaps == 1);
         small_host[0] = small_host[1] = small_host[4] = small_host[5] = -1;
         check(halide_vulkan_buffer_copy(nullptr, &crop, nullptr, &small) == 0);
-        check(copies == 0 && maps == 2 && unmaps == 2 && barriers == 1);
+        check(copies == 0 && maps == 2 && unmaps == 2 && barriers == 0);
         check(small_host[0] == 777 && small_host[1] == 778 && small_host[4] == 779 && small_host[5] == 780);
         check(small_host[2] == -1 && small_host[3] == -1 && small_host[6] == -1 && small_host[7] == -1);
         check(halide_vulkan_copy_to_host(nullptr, &buffer) == 0);
@@ -706,6 +722,8 @@ void test_transfers(bool coherent, bool unified, bool reject_allocation = false,
     }
     check(halide_vulkan_device_free(nullptr, &buffer) == 0);
     check(halide_vulkan_device_free(nullptr, &prefix) == 0);
+    check(halide_vulkan_device_release(nullptr) == 0);
+    check(dispatch_arenas == nullptr);
     // Collect cached blocks through the allocator's callback context before
     // destroying the allocator itself.
     allocator->collect(nullptr);
@@ -809,7 +827,7 @@ void test_scalar_argument_alignment() {
 }
 
 void test_argument_pages() {
-    VulkanDispatchArena arena = {nullptr, allocator, (VkQueue)1, nullptr, nullptr};
+    VulkanDispatchArena arena = {nullptr, allocator, (VkQueue)1, nullptr, nullptr, false};
     VkDescriptorBufferInfo first = {}, second = {}, slice = {};
     uint8_t *a = nullptr, *b = nullptr, *mapped = nullptr;
     int maps_before = maps;
@@ -1185,6 +1203,155 @@ void test_command_grouping(bool specialized, bool unified, bool coherent = true,
     check(run(a, 12) == 0);
     check(halide_vulkan_device_release(nullptr) == 0);
     check(submissions == 1 && executed_dispatches == 1 && command_batches == nullptr);
+
+    if (mapped) {
+        host_a[0] = host_b[0] = 0;
+        check(halide_vulkan_copy_to_device(nullptr, &a) == 0);
+        check(halide_vulkan_copy_to_device(nullptr, &b) == 0);
+        reset_counts();
+        check(run(a, 1) == 0 && run(b, 2) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(submissions == 1 && waits == 1 && host_barriers == 1);
+        check(pools_created == 1 && pools_destroyed == 1);
+        check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+        halide_buffer_t host_buffer = b;
+        host_buffer.device = 0;
+        host_buffer.device_interface = nullptr;
+        check(halide_vulkan_buffer_copy(nullptr, &b, nullptr, &host_buffer) == 0);
+        check(submissions == 1 && waits == 1 && host_barriers == 1);
+        check(host_a[0] == 1 + t && host_b[0] == 2 + t);
+
+        // A mapped upload through buffer_copy waits only for the pending batch.
+        reset_counts();
+        check(run(a, 0) == 0);
+        halide_buffer_t upload = a;
+        upload.device = 0;
+        upload.device_interface = nullptr;
+        check(halide_vulkan_buffer_copy(nullptr, &upload, &vulkan_device_interface, &a) == 0);
+        check(submissions == 1 && waits == 1 && executed_dispatches == 1);
+
+        // The buffer-copy entry point also folds host visibility into a batch.
+        reset_counts();
+        check(run(b, 3) == 0);
+        check(halide_vulkan_buffer_copy(nullptr, &b, nullptr, &host_buffer) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(submissions == 1 && waits == 1 && host_barriers == 1);
+        check(host_b[0] == 7 + 3 * t);
+
+        // Copy-only work invalidates readiness, just like a shader dispatch.
+        reset_counts();
+        check(halide_vulkan_buffer_copy(nullptr, &a, &vulkan_device_interface, &b) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(submissions == 1 && waits == 1 && host_barriers == 1);
+        check(host_b[0] == host_a[0]);
+
+        // A device-only flush leaves one host dependency for the first read.
+        check(run(a, 4) == 0);
+        check(halide_vulkan_device_sync(nullptr, &a) == 0);
+        reset_counts();
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+        check(submissions == 1 && waits == 1 && host_barriers == 1);
+
+        // Standalone staging transfers also invalidate the queue-wide dependency.
+        // Force a dedicated device-only allocation alongside the mapped buffers.
+        MemoryRequest request = {};
+        request.size = a.size_in_bytes();
+        request.dedicated = true;
+        request.properties.usage = MemoryUsage::TransferSrcDst;
+        request.properties.caching = MemoryCaching::Uncached;
+        request.properties.visibility = MemoryVisibility::DeviceOnly;
+        reject_unified_allocation = true;
+        MemoryRegion *staged_region = allocator->reserve(nullptr, request);
+        check(staged_region != nullptr && !reject_unified_allocation);
+        check(!vk_can_copy_mapped(nullptr, allocator, staged_region));
+        int32_t staged_host[4] = {1, 2, 3, 4};
+        halide_buffer_t staged = a;
+        staged.host = (uint8_t *)staged_host;
+        staged.device = (uint64_t)staged_region;
+        reset_counts();
+        check(halide_vulkan_copy_to_device(nullptr, &staged) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+        check(submissions == 2 && waits == 2 && host_barriers == 1);
+        reset_counts();
+        check(halide_vulkan_copy_to_host(nullptr, &staged) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(submissions == 2 && waits == 2 && host_barriers == 1);
+        halide_buffer_t staged_host_buffer = staged;
+        staged_host_buffer.device = 0;
+        staged_host_buffer.device_interface = nullptr;
+        for (int direction = 0; direction < 2; direction++) {
+            reset_counts();
+            check(direction ? halide_vulkan_buffer_copy(nullptr, &staged, nullptr, &staged_host_buffer) == 0 :
+                              halide_vulkan_buffer_copy(nullptr, &staged_host_buffer, &vulkan_device_interface, &staged) == 0);
+            const int submitted = submissions, waited = waits;
+            check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+            check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+            check(submissions == submitted + 1 && waits == waited + 1 && host_barriers == 1);
+        }
+        check(allocator->reclaim(nullptr, staged_region) == 0);
+
+        // Readiness is scoped to the queue and survives release of another one.
+        reset_counts();
+        test_queue = (VkQueue)2;
+        check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+        check(submissions == 1 && waits == 1 && host_barriers == 1);
+        check(halide_vulkan_device_release(nullptr) == 0);
+        test_queue = (VkQueue)1;
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(submissions == 1 && waits == 1 && host_barriers == 1);
+
+        // Failed submissions retain the barrier, without permitting host reads.
+        reset_counts();
+        check(run(a, 5) == 0);
+        int maps_before = maps;
+        submit_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        check(halide_vulkan_copy_to_host(nullptr, &a) != 0);
+        check(submissions == 1 && waits == 0 && host_barriers == 1 && maps == maps_before);
+        submit_result = VK_SUCCESS;
+        check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(submissions == 2 && waits == 1 && host_barriers == 1);
+
+        // Failed waits neither mark readiness nor resubmit the command buffer.
+        reset_counts();
+        check(run(a, 6) == 0);
+        maps_before = maps;
+        wait_result = VK_ERROR_DEVICE_LOST;
+        check(halide_vulkan_copy_to_host(nullptr, &a) != 0);
+        check(halide_vulkan_copy_to_host(nullptr, &b) != 0);
+        check(submissions == 1 && waits == 2 && host_barriers == 1 && maps == maps_before);
+        check(pools_destroyed == 0);
+        wait_result = VK_SUCCESS;
+        check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(submissions == 1 && waits == 3 && host_barriers == 1 && pools_destroyed == 1);
+
+        // An already-ended device-only batch needs a separate host dependency.
+        reset_counts();
+        check(run(a, 7) == 0);
+        submit_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        check(halide_vulkan_device_sync(nullptr, &a) != 0);
+        submit_result = VK_SUCCESS;
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+        check(submissions == 3 && waits == 2 && host_barriers == 1);
+
+        // An end failure discards the batch; a fresh barrier can still be retried.
+        reset_counts();
+        check(run(a, 8) == 0);
+        maps_before = maps;
+        end_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        check(halide_vulkan_copy_to_host(nullptr, &a) != 0);
+        check(submissions == 0 && waits == 0 && maps == maps_before);
+        end_result = VK_SUCCESS;
+        check(halide_vulkan_copy_to_host(nullptr, &a) == 0);
+        check(halide_vulkan_copy_to_host(nullptr, &b) == 0);
+        check(submissions == 1 && waits == 1 && host_barriers == 2);
+        check(halide_vulkan_device_release(nullptr) == 0);
+    }
 
     // Cross a descriptor pool boundary and reuse both pools on the next batch.
     host_a[0] = 0;

@@ -122,6 +122,7 @@ struct VulkanDispatchArena {
     VkQueue queue;
     VulkanDescriptorPool *pools;
     VulkanArgumentPage *pages;
+    bool host_reads_ready;  // A completed host dependency, retained across batches.
 };
 
 struct VulkanDeferredFree {
@@ -141,6 +142,7 @@ struct VulkanCommandBatch {
     VulkanDeferredFree *frees;
     bool ended;
     bool submitted;
+    bool host_read_barrier;
 };
 
 WEAK VulkanCommandBatch *command_batches = nullptr;
@@ -154,22 +156,36 @@ void vk_destroy_command_resources(void *user_context, VulkanMemoryAllocator *all
     vk_host_free(user_context, resources, allocator->callbacks());
 }
 
+VulkanDispatchArena *vk_find_dispatch_arena(VulkanMemoryAllocator *allocator, VkQueue queue) {
+    for (auto *arena = dispatch_arenas; arena; arena = arena->next) {
+        if (arena->allocator == allocator && arena->queue == queue) {
+            return arena;
+        }
+    }
+    return nullptr;
+}
+
+void vk_invalidate_host_reads(VulkanMemoryAllocator *allocator, VkQueue queue) {
+    ScopedMutexLock lock(&command_batches_mutex);
+    if (auto *arena = vk_find_dispatch_arena(allocator, queue)) {
+        arena->host_reads_ready = false;
+    }
+}
+
 int vk_get_dispatch_arena(void *user_context, VulkanCommandBatch *batch) {
     if (batch->arena) {
         return halide_error_code_success;
     }
-    for (auto *arena = dispatch_arenas; arena; arena = arena->next) {
-        if (arena->allocator == batch->allocator && arena->queue == batch->queue) {
-            batch->arena = arena;
-            return halide_error_code_success;
-        }
+    if (auto *arena = vk_find_dispatch_arena(batch->allocator, batch->queue)) {
+        batch->arena = arena;
+        return halide_error_code_success;
     }
     auto *arena = (VulkanDispatchArena *)vk_host_malloc(user_context, sizeof(VulkanDispatchArena), 0,
                                                         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT, batch->allocator->callbacks());
     if (!arena) {
         return halide_error_code_out_of_memory;
     }
-    *arena = {dispatch_arenas, batch->allocator, batch->queue, nullptr, nullptr};
+    *arena = {dispatch_arenas, batch->allocator, batch->queue, nullptr, nullptr, false};
     dispatch_arenas = batch->arena = arena;
     return halide_error_code_success;
 }
@@ -383,19 +399,26 @@ void vk_destroy_command_batch(void *user_context, VulkanCommandBatch *batch) {
 
 // Called with both the context and command_batches_mutex held. Failed waits
 // retain the submitted batch, so its resources are never freed while in use.
-int vk_flush_command_batch_locked(void *user_context, VulkanMemoryAllocator *allocator, VkQueue queue) {
+int vk_flush_command_batch_locked(void *user_context, VulkanMemoryAllocator *allocator, VkQueue queue,
+                                  bool host_read = false) {
     VulkanCommandBatch **slot = vk_find_command_batch(allocator, queue);
     VulkanCommandBatch *batch = *slot;
     if (!batch) {
         return halide_error_code_success;
     }
     if (!batch->ended) {
-        // Make writes visible to subsequent transfers and external queue work.
+        // Make writes visible to subsequent device work and, for readback, the host.
         VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        VkPipelineStageFlags destination_stages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        if (host_read) {
+            barrier.dstAccessMask |= VK_ACCESS_HOST_READ_BIT;
+            destination_stages |= VK_PIPELINE_STAGE_HOST_BIT;
+        }
         vkCmdPipelineBarrier(batch->command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                             destination_stages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+        batch->host_read_barrier = host_read;
         VkResult result = vkEndCommandBuffer(batch->command_buffer);
         if (result != VK_SUCCESS) {
             error(user_context) << "Vulkan: vkEndCommandBuffer returned " << vk_get_error_name(result) << "\n";
@@ -418,6 +441,9 @@ int vk_flush_command_batch_locked(void *user_context, VulkanMemoryAllocator *all
         return halide_error_code_generic_error;
     }
     *slot = batch->next;
+    if (batch->host_read_barrier) {
+        batch->arena->host_reads_ready = true;
+    }
     vk_destroy_command_batch(user_context, batch);
     return halide_error_code_success;
 }
@@ -457,6 +483,7 @@ int vk_get_command_batch(void *user_context, const VulkanContext &ctx, VulkanCom
         if ((*slot)->ended) {
             return halide_error_code_generic_error;
         }
+        (*slot)->arena->host_reads_ready = false;
         *out = *slot;
         return halide_error_code_success;
     }
@@ -481,13 +508,44 @@ int vk_get_command_batch(void *user_context, const VulkanContext &ctx, VulkanCom
             error_code = halide_error_code_generic_error;
         }
     }
+    if (error_code == halide_error_code_success) {
+        error_code = vk_get_dispatch_arena(user_context, batch);
+    }
     if (error_code != halide_error_code_success) {
         vk_destroy_command_batch(user_context, batch);
         return error_code;
     }
     *slot = batch;
+    batch->arena->host_reads_ready = false;
     *out = batch;
     return halide_error_code_success;
+}
+
+// Readback shares one submission and wait with any pending work. The global
+// memory barrier covers later reads of other allocations on this queue too.
+int vk_prepare_host_read(void *user_context, const VulkanContext &ctx) {
+    ScopedMutexLock lock(&command_batches_mutex);
+    VulkanCommandBatch *batch = *vk_find_command_batch(ctx.allocator, ctx.queue);
+    if (batch && batch->ended && !batch->host_read_barrier) {
+        // A previous submit or wait failed after ending a device-only batch.
+        // Finish it before recording the missing host dependency.
+        int error_code = vk_flush_command_batch_locked(user_context, ctx.allocator, ctx.queue);
+        if (error_code != halide_error_code_success) {
+            return error_code;
+        }
+        batch = nullptr;
+    }
+    if (!batch) {
+        auto *arena = vk_find_dispatch_arena(ctx.allocator, ctx.queue);
+        if (arena && arena->host_reads_ready) {
+            return halide_error_code_success;
+        }
+        int error_code = vk_get_command_batch(user_context, ctx, &batch);
+        if (error_code != halide_error_code_success) {
+            return error_code;
+        }
+    }
+    return vk_flush_command_batch_locked(user_context, ctx.allocator, ctx.queue, true);
 }
 
 int vk_enqueue_device_copy(void *user_context, const VulkanContext &ctx,
@@ -571,52 +629,10 @@ bool vk_can_copy_mapped(void *user_context, VulkanMemoryAllocator *allocator, Me
 
 // Coherent device-local memory can be copied directly, without a staging buffer or
 // issuing a device-to-device copy. The context lock serializes mappings of the
-// same memory block. Independent uploads can skip the queue wait after checking
-// for references in the pending batch.
+// same memory block. Callers synchronize uploads with vk_prepare_upload or
+// vk_flush_command_batch, and reads with vk_prepare_host_read.
 int vk_copy_mapped(void *user_context, const VulkanContext &ctx, MemoryRegion *region,
-                   device_copy copy, bool to_host, uint32_t element_size, bool wait_before_write = true) {
-    if (to_host) {
-        // Waiting for the queue alone does not make shader/transfer writes
-        // visible to the host. Submit a device-to-host memory dependency first.
-        ScopedVulkanCommandBufferAndPool cmds(user_context, ctx.allocator, ctx.queue_family_index);
-        if (cmds.error_code != halide_error_code_success) {
-            return cmds.error_code;
-        }
-        VkCommandBufferBeginInfo begin_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VkResult result = vkBeginCommandBuffer(cmds.command_buffer, &begin_info);
-        if (result != VK_SUCCESS) {
-            error(user_context) << "Vulkan: vkBeginCommandBuffer returned " << vk_get_error_name(result) << "\n";
-            return halide_error_code_device_buffer_copy_failed;
-        }
-        VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        vkCmdPipelineBarrier(cmds.command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                             0, 1, &barrier, 0, nullptr, 0, nullptr);
-        result = vkEndCommandBuffer(cmds.command_buffer);
-        if (result != VK_SUCCESS) {
-            error(user_context) << "Vulkan: vkEndCommandBuffer returned " << vk_get_error_name(result) << "\n";
-            return halide_error_code_device_buffer_copy_failed;
-        }
-        int error_code = vk_submit_command_buffer(user_context, ctx.queue, cmds.command_buffer);
-        if (error_code != halide_error_code_success) {
-            return error_code;
-        }
-        // Keep the command buffer alive until it has finished executing.
-        result = vkQueueWaitIdle(ctx.queue);
-        if (result != VK_SUCCESS) {
-            error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
-            return halide_error_code_device_buffer_copy_failed;
-        }
-    } else if (wait_before_write) {
-        VkResult result = vkQueueWaitIdle(ctx.queue);
-        if (result != VK_SUCCESS) {
-            error(user_context) << "Vulkan: vkQueueWaitIdle returned " << vk_get_error_name(result) << "\n";
-            return halide_error_code_device_buffer_copy_failed;
-        }
-    }
-
+                   device_copy copy, bool to_host, uint32_t element_size) {
     const VulkanMemoryAllocation *allocation = ctx.allocator->allocation_for(user_context, region);
     // Map the whole block to include suballocations and cropped buffers.
     void *mapped = nullptr;
@@ -1010,7 +1026,7 @@ WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halid
     device_copy copy_helper = make_host_to_device_copy(halide_buffer);
 
     if (vk_can_copy_mapped(user_context, ctx.allocator, mapped_region)) {
-        return vk_copy_mapped(user_context, ctx, mapped_region, copy_helper, false, halide_buffer->type.bytes(), false);
+        return vk_copy_mapped(user_context, ctx, mapped_region, copy_helper, false, halide_buffer->type.bytes());
     }
 
     // We construct a staging buffer to copy into from host memory.  Then,
@@ -1144,6 +1160,7 @@ WEAK int halide_vulkan_copy_to_device(void *user_context, halide_buffer_t *halid
             nullptr                         // the semaphores to signal
     };
 
+    vk_invalidate_host_reads(ctx.allocator, ctx.queue);
     result = vkQueueSubmit(ctx.queue, 1, &submit_info, VK_NULL_HANDLE);
     if (result != VK_SUCCESS) {
         error(user_context) << "Vulkan: vkQueueSubmit returned " << vk_get_error_name(result) << "\n";
@@ -1192,11 +1209,6 @@ WEAK int halide_vulkan_copy_to_host(void *user_context, halide_buffer_t *halide_
         return ctx.error;
     }
 
-    int flush_error = vk_flush_command_batch(user_context, ctx.allocator, ctx.queue);
-    if (flush_error != halide_error_code_success) {
-        return flush_error;
-    }
-
 #ifdef DEBUG_RUNTIME
     uint64_t t_before = halide_current_time_ns(user_context);
 #endif
@@ -1209,7 +1221,16 @@ WEAK int halide_vulkan_copy_to_host(void *user_context, halide_buffer_t *halide_
 
     MemoryRegion *mapped_region = reinterpret_cast<MemoryRegion *>(halide_buffer->device);
     if (vk_can_copy_mapped(user_context, ctx.allocator, mapped_region)) {
+        int error_code = vk_prepare_host_read(user_context, ctx);
+        if (error_code != halide_error_code_success) {
+            return error_code;
+        }
         return vk_copy_mapped(user_context, ctx, mapped_region, copy_helper, true, halide_buffer->type.bytes());
+    }
+
+    int flush_error = vk_flush_command_batch(user_context, ctx.allocator, ctx.queue);
+    if (flush_error != halide_error_code_success) {
+        return flush_error;
     }
 
     // This is the inverse of copy_to_device: we create a staging buffer, copy into
@@ -1324,6 +1345,7 @@ WEAK int halide_vulkan_copy_to_host(void *user_context, halide_buffer_t *halide_
             nullptr                         // the semaphores to signal
     };
 
+    vk_invalidate_host_reads(ctx.allocator, ctx.queue);
     result = vkQueueSubmit(ctx.queue, 1, &submit_info, VK_NULL_HANDLE);
     if (result != VK_SUCCESS) {
         error(user_context) << "Vulkan: vkQueueSubmit returned " << vk_get_error_name(result) << "\n";
@@ -1417,11 +1439,6 @@ WEAK int halide_vulkan_buffer_copy(void *user_context, struct halide_buffer_t *s
             return vk_enqueue_device_copy(user_context, ctx, src, dst, copy_helper);
         }
 
-        int flush_error = vk_flush_command_batch(user_context, ctx.allocator, ctx.queue);
-        if (flush_error != halide_error_code_success) {
-            return flush_error;
-        }
-
         debug(user_context)
             << "halide_vulkan_buffer_copy (user_context: " << user_context
             << ", src: " << src << ", dst: " << dst << ")\n";
@@ -1432,8 +1449,18 @@ WEAK int halide_vulkan_buffer_copy(void *user_context, struct halide_buffer_t *s
         if (from_host != to_host) {
             MemoryRegion *mapped_region = reinterpret_cast<MemoryRegion *>(to_host ? src->device : dst->device);
             if (vk_can_copy_mapped(user_context, ctx.allocator, mapped_region)) {
+                int error_code = to_host ? vk_prepare_host_read(user_context, ctx) :
+                                           vk_flush_command_batch(user_context, ctx.allocator, ctx.queue);
+                if (error_code != halide_error_code_success) {
+                    return error_code;
+                }
                 return vk_copy_mapped(user_context, ctx, mapped_region, copy_helper, to_host, src->type.bytes());
             }
+        }
+
+        int flush_error = vk_flush_command_batch(user_context, ctx.allocator, ctx.queue);
+        if (flush_error != halide_error_code_success) {
+            return flush_error;
         }
 
         MemoryRegion *staging_region = nullptr;
@@ -1620,6 +1647,7 @@ WEAK int halide_vulkan_buffer_copy(void *user_context, struct halide_buffer_t *s
                 nullptr                         // the semaphores to signal
         };
 
+        vk_invalidate_host_reads(ctx.allocator, ctx.queue);
         result = vkQueueSubmit(ctx.queue, 1, &submit_info, VK_NULL_HANDLE);
         if (result != VK_SUCCESS) {
             error(user_context) << "vkQueueSubmit returned " << vk_get_error_name(result) << "\n";
@@ -1891,11 +1919,6 @@ WEAK int halide_vulkan_run(void *user_context,
     if (error_code != halide_error_code_success) {
         return error_code;
     }
-    error_code = vk_get_dispatch_arena(user_context, batch);
-    if (error_code != halide_error_code_success) {
-        return error_code;
-    }
-
     size_t argument_bytes = vk_estimate_scalar_uniform_buffer_size(user_context, arg_sizes, args, arg_is_buffer);
     uint32_t push_constants[32] = {};
     VkDescriptorBufferInfo args_buffer = {};
